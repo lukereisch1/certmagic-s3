@@ -3,6 +3,8 @@ package certmagic_s3
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +15,8 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -39,6 +43,13 @@ type S3 struct {
 	logger *zap.Logger
 	client *minio.Client
 
+	// locks tracks the locks this process currently holds, keyed by the S3 lock
+	// object key. Each entry carries the acquisition token (so Unlock only
+	// deletes a lock we still own) and a cancel func to stop its heartbeat.
+	// Guarded by locksMu.
+	locksMu sync.Mutex
+	locks   map[string]*heldLock
+
 	// S3 configuration
 	Host           string `json:"host"`
 	Bucket         string `json:"bucket"`
@@ -47,6 +58,39 @@ type S3 struct {
 	Prefix         string `json:"prefix,omitempty"`
 	Insecure       bool   `json:"insecure"`
 	UseIamProvider bool   `json:"use_iam_provider"`
+}
+
+const (
+	// lockExpiration is how long a lock may go without a heartbeat refresh
+	// before another process treats the holder as dead and steals it. Because a
+	// live holder refreshes its lock every lockRefreshInterval, this does NOT
+	// need to cover worst-case issuance time: a live holder is never stolen no
+	// matter how long ACME/backoff takes, and only a crashed holder (whose
+	// heartbeat stopped) is reclaimed, within roughly lockExpiration.
+	lockExpiration = 60 * time.Second
+
+	// lockRefreshInterval is how often a holder rewrites its lock object to
+	// prove liveness. It must be comfortably smaller than lockExpiration so a
+	// couple of missed refreshes (a transient S3 blip) don't cause a false
+	// steal of a still-live lock.
+	lockRefreshInterval = 20 * time.Second
+
+	// lockPollInterval is how long a waiter sleeps between attempts when the
+	// lock for the same name is currently held by someone else.
+	lockPollInterval = 1 * time.Second
+
+	// lockMaxLifetime caps how long the heartbeat keeps refreshing a single
+	// lock. It is a safety net against a leaked lock (Unlock never called)
+	// pinning a domain forever: after this the heartbeat stops, the lock goes
+	// stale, and it becomes stealable.
+	lockMaxLifetime = 10 * time.Minute
+)
+
+// heldLock is the bookkeeping for a lock this process currently holds.
+type heldLock struct {
+	token  string
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 func (s3 *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
@@ -173,6 +217,7 @@ func (s3 *S3) Provision(ctx caddy.Context) error {
 	}
 
 	s3.client = client
+	s3.locks = make(map[string]*heldLock)
 	return nil
 }
 
@@ -189,18 +234,217 @@ func (s3 *S3) CertMagicStorage() (certmagic.Storage, error) {
 	return s3, nil
 }
 
-// Lock and Unlock are intentional no-ops in this fork: this plugin does not
-// implement certmagic's distributed lock in S3. That means certificate
-// issuance is NOT serialized or deduplicated across goroutines or across
-// instances, so concurrent requests for the same domain can each fire their
-// own ACME order. If you are overwhelming the CA on cold start, this is the
-// most likely root cause and wants a real S3-backed lock, not just logging.
+// Lock implements a distributed lock backed by S3 so certificate issuance is
+// serialized and deduplicated across goroutines AND across instances. Without
+// it, concurrent requests for the same domain each fire their own ACME order,
+// which is what overwhelms the CA on cold start.
+//
+// Acquisition is atomic: PutObject with If-None-Match: * (via SetMatchETagExcept)
+// creates the lock object only if it does not already exist, so exactly one
+// caller wins even under a race; everyone else gets 412 PreconditionFailed and
+// waits. Once held, a heartbeat refreshes the lock every lockRefreshInterval so
+// a live holder is never stolen regardless of how long issuance takes; only a
+// crashed holder (heartbeat stopped) goes stale and is stolen after
+// lockExpiration. Honors ctx cancellation.
 func (s3 *S3) Lock(ctx context.Context, key string) error {
+	lockKey := s3.LockKey(key)
+	token, err := newLockToken()
+	if err != nil {
+		s3.logger.Error("lock token generation failed", zap.String("key", lockKey), zap.Error(err))
+		return err
+	}
+
+	for {
+		err := s3.tryAcquireLock(ctx, lockKey, token)
+		if err == nil {
+			s3.startHeartbeat(lockKey, token)
+			s3.logger.Debug("lock acquired", zap.String("key", lockKey))
+			return nil
+		}
+
+		if !isPreconditionFailed(err) {
+			// A throttle/network/permission error here (not "lock already
+			// held") means we could not even attempt the lock. Surface it so a
+			// storage outage isn't silently swallowed into unserialized issuance.
+			s3.logger.Error("lock acquire failed",
+				zap.String("key", lockKey),
+				zap.String("s3_error_code", s3ErrorCode(err)),
+				zap.Error(err))
+			return err
+		}
+
+		// The lock is held. Steal it if it has expired, otherwise wait.
+		if info, serr := s3.client.StatObject(ctx, s3.Bucket, lockKey, minio.StatObjectOptions{}); serr == nil {
+			if time.Since(info.LastModified) > lockExpiration {
+				s3.logger.Warn("stealing expired lock",
+					zap.String("key", lockKey),
+					zap.Time("acquired_at", info.LastModified))
+				if rerr := s3.client.RemoveObject(ctx, s3.Bucket, lockKey, minio.RemoveObjectOptions{}); rerr != nil {
+					s3.logger.Error("failed to remove expired lock",
+						zap.String("key", lockKey),
+						zap.String("s3_error_code", s3ErrorCode(rerr)),
+						zap.Error(rerr))
+				}
+				continue
+			}
+		}
+
+		select {
+		case <-time.After(lockPollInterval):
+		case <-ctx.Done():
+			s3.logger.Debug("lock wait canceled", zap.String("key", lockKey), zap.Error(ctx.Err()))
+			return ctx.Err()
+		}
+	}
+}
+
+// Unlock releases a lock previously acquired by this process. It stops the
+// heartbeat first, then deletes the lock object only if we still own it (the
+// stored token still matches ours), so we never delete a lock that was stolen
+// from us after expiry and re-acquired by someone else.
+func (s3 *S3) Unlock(ctx context.Context, key string) error {
+	lockKey := s3.LockKey(key)
+
+	s3.locksMu.Lock()
+	held, ok := s3.locks[lockKey]
+	delete(s3.locks, lockKey)
+	s3.locksMu.Unlock()
+
+	if !ok {
+		s3.logger.Debug("unlock called for a lock we do not track; skipping delete", zap.String("key", lockKey))
+		return nil
+	}
+
+	// Stop the heartbeat and wait for it to exit before deleting, so an
+	// in-flight refresh can't recreate the object right after we remove it.
+	held.cancel()
+	<-held.done
+
+	if current, err := s3.readLockToken(ctx, lockKey); err == nil && current != held.token {
+		s3.logger.Warn("lock no longer owned by us; not deleting", zap.String("key", lockKey))
+		return nil
+	}
+
+	if err := s3.client.RemoveObject(ctx, s3.Bucket, lockKey, minio.RemoveObjectOptions{}); err != nil {
+		s3.logger.Error("unlock failed",
+			zap.String("key", lockKey),
+			zap.String("s3_error_code", s3ErrorCode(err)),
+			zap.Error(err))
+		return err
+	}
+
+	s3.logger.Debug("lock released", zap.String("key", lockKey))
 	return nil
 }
 
-func (s3 *S3) Unlock(ctx context.Context, key string) error {
-	return nil
+// startHeartbeat records the held lock and launches a goroutine that keeps its
+// lock object fresh until Unlock (or lockMaxLifetime) stops it.
+func (s3 *S3) startHeartbeat(lockKey, token string) {
+	hbCtx, cancel := context.WithTimeout(context.Background(), lockMaxLifetime)
+	done := make(chan struct{})
+
+	s3.locksMu.Lock()
+	s3.locks[lockKey] = &heldLock{token: token, cancel: cancel, done: done}
+	s3.locksMu.Unlock()
+
+	go s3.refreshLock(hbCtx, lockKey, token, done)
+}
+
+// refreshLock rewrites the lock object every lockRefreshInterval to prove the
+// holder is still alive, so the lock's age never crosses lockExpiration while
+// we hold it. It refreshes only while we still own the lock, so it never
+// resurrects a lock that was legitimately stolen and released by someone else.
+func (s3 *S3) refreshLock(ctx context.Context, lockKey, token string, done chan struct{}) {
+	defer close(done)
+
+	ticker := time.NewTicker(lockRefreshInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			current, err := s3.readLockToken(ctx, lockKey)
+			if err != nil {
+				if isNotExist(err) {
+					s3.logger.Warn("held lock disappeared; stopping heartbeat", zap.String("key", lockKey))
+					return
+				}
+				// A transient read error: skip this refresh rather than risk
+				// clobbering a newer owner. If it persists, our lock will go
+				// stale and be stolen, which is the correct outcome when S3 is
+				// unhealthy.
+				s3.logger.Warn("lock heartbeat read failed; skipping refresh",
+					zap.String("key", lockKey),
+					zap.String("s3_error_code", s3ErrorCode(err)),
+					zap.Error(err))
+				continue
+			}
+			if current != token {
+				s3.logger.Warn("held lock was stolen; stopping heartbeat", zap.String("key", lockKey))
+				return
+			}
+
+			body := []byte(token)
+			if _, err := s3.client.PutObject(ctx, s3.Bucket, lockKey, bytes.NewReader(body), int64(len(body)), minio.PutObjectOptions{ContentType: "text/plain"}); err != nil {
+				s3.logger.Warn("lock heartbeat refresh failed",
+					zap.String("key", lockKey),
+					zap.String("s3_error_code", s3ErrorCode(err)),
+					zap.Error(err))
+			}
+		}
+	}
+}
+
+// tryAcquireLock attempts to atomically create the lock object. If-None-Match: *
+// makes S3 reject the write (412 PreconditionFailed) when the object already
+// exists, so only one concurrent caller can succeed.
+func (s3 *S3) tryAcquireLock(ctx context.Context, lockKey, token string) error {
+	opts := minio.PutObjectOptions{ContentType: "text/plain"}
+	opts.SetMatchETagExcept("*")
+
+	body := []byte(token)
+	_, err := s3.client.PutObject(ctx, s3.Bucket, lockKey, bytes.NewReader(body), int64(len(body)), opts)
+	return err
+}
+
+// readLockToken returns the token currently stored in the lock object.
+func (s3 *S3) readLockToken(ctx context.Context, lockKey string) (string, error) {
+	object, err := s3.client.GetObject(ctx, s3.Bucket, lockKey, minio.GetObjectOptions{})
+	if err != nil {
+		return "", err
+	}
+	defer object.Close()
+
+	data, err := io.ReadAll(object)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// LockKey maps a certmagic lock name to a dedicated S3 key namespace, kept
+// separate from stored data so lock objects never show up in List of certs.
+func (s3 *S3) LockKey(key string) string {
+	return s3.KeyPrefix(path.Join("locks", key+".lock"))
+}
+
+// newLockToken returns a random token that uniquely identifies one acquisition,
+// used to prove ownership on Unlock.
+func newLockToken() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// isPreconditionFailed reports whether err is S3's 412 response, i.e. the lock
+// object already existed and our atomic create was rejected.
+func isPreconditionFailed(err error) bool {
+	resp := minio.ToErrorResponse(err)
+	return resp.StatusCode == http.StatusPreconditionFailed || resp.Code == "PreconditionFailed"
 }
 
 func (s3 *S3) Store(ctx context.Context, key string, value []byte) error {
