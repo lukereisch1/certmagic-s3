@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
@@ -188,6 +189,12 @@ func (s3 *S3) CertMagicStorage() (certmagic.Storage, error) {
 	return s3, nil
 }
 
+// Lock and Unlock are intentional no-ops in this fork: this plugin does not
+// implement certmagic's distributed lock in S3. That means certificate
+// issuance is NOT serialized or deduplicated across goroutines or across
+// instances, so concurrent requests for the same domain can each fire their
+// own ACME order. If you are overwhelming the CA on cold start, this is the
+// most likely root cause and wants a real S3-backed lock, not just logging.
 func (s3 *S3) Lock(ctx context.Context, key string) error {
 	return nil
 }
@@ -200,9 +207,16 @@ func (s3 *S3) Store(ctx context.Context, key string, value []byte) error {
 	key = s3.KeyPrefix(key)
 	length := int64(len(value))
 
-	s3.logger.Debug(fmt.Sprintf("Store: %s, %d bytes", key, length))
+	s3.logger.Debug("store", zap.String("key", key), zap.Int64("bytes", length))
 
 	_, err := s3.client.PutObject(ctx, s3.Bucket, key, bytes.NewReader(value), length, minio.PutObjectOptions{})
+	if err != nil {
+		s3.logger.Error("store failed",
+			zap.String("key", key),
+			zap.Int64("bytes", length),
+			zap.String("s3_error_code", s3ErrorCode(err)),
+			zap.Error(err))
+	}
 
 	return err
 }
@@ -214,48 +228,96 @@ func (s3 *S3) Load(ctx context.Context, key string) ([]byte, error) {
 
 	key = s3.KeyPrefix(key)
 
-	s3.logger.Debug(fmt.Sprintf("Load key: %s", key))
+	s3.logger.Debug("load", zap.String("key", key))
 
 	object, err := s3.client.GetObject(ctx, s3.Bucket, key, minio.GetObjectOptions{})
-
 	if err != nil {
+		s3.logger.Error("load failed",
+			zap.String("key", key),
+			zap.String("s3_error_code", s3ErrorCode(err)),
+			zap.Error(err))
 		return nil, err
 	}
 	defer object.Close()
 
-	return io.ReadAll(object)
+	// minio's GetObject is lazy: transport, throttling and not-found errors
+	// surface here on the first read rather than from GetObject above.
+	data, err := io.ReadAll(object)
+	if err != nil {
+		s3.logger.Error("load read failed",
+			zap.String("key", key),
+			zap.String("s3_error_code", s3ErrorCode(err)),
+			zap.Error(err))
+		return nil, err
+	}
+
+	return data, nil
 }
 
 func (s3 *S3) Delete(ctx context.Context, key string) error {
 	key = s3.KeyPrefix(key)
 
-	s3.logger.Debug(fmt.Sprintf("Delete key: %s", key))
+	s3.logger.Debug("delete", zap.String("key", key))
 
-	return s3.client.RemoveObject(ctx, s3.Bucket, key, minio.RemoveObjectOptions{})
+	err := s3.client.RemoveObject(ctx, s3.Bucket, key, minio.RemoveObjectOptions{})
+	if err != nil {
+		s3.logger.Error("delete failed",
+			zap.String("key", key),
+			zap.String("s3_error_code", s3ErrorCode(err)),
+			zap.Error(err))
+	}
+
+	return err
 }
 
 func (s3 *S3) Exists(ctx context.Context, key string) bool {
 	key = s3.KeyPrefix(key)
 
 	_, err := s3.client.StatObject(ctx, s3.Bucket, key, minio.StatObjectOptions{})
+	if err == nil {
+		s3.logger.Debug("exists", zap.String("key", key), zap.Bool("exists", true))
+		return true
+	}
 
-	exists := err == nil
+	if isNotExist(err) {
+		s3.logger.Debug("exists", zap.String("key", key), zap.Bool("exists", false))
+		return false
+	}
 
-	s3.logger.Debug(fmt.Sprintf("Check exists: %s, %t", key, exists))
+	// A non-404 failure (throttling, network, permissions) is reported to
+	// certmagic as "does not exist", which makes it request a fresh cert from
+	// the CA even though one may already be cached in S3. This is how an S3
+	// overload turns into a CA stampede, so log it loudly and tag the S3 code
+	// (e.g. SlowDown, RequestLimitExceeded) to confirm throttling from logs.
+	s3.logger.Error("exists check failed; treating as not-exist, which may trigger a spurious CA request",
+		zap.String("key", key),
+		zap.String("s3_error_code", s3ErrorCode(err)),
+		zap.Error(err))
 
-	return exists
+	return false
 }
 
 func (s3 *S3) List(ctx context.Context, prefix string, recursive bool) ([]string, error) {
+	prefix = s3.KeyPrefix(prefix)
 
 	objects := s3.client.ListObjects(ctx, s3.Bucket, minio.ListObjectsOptions{
-		Prefix:    s3.KeyPrefix(prefix),
+		Prefix:    prefix,
 		Recursive: recursive,
 	})
 
-	keys := make([]string, len(objects))
+	// Start empty and append: len() on the results channel is its buffered
+	// count, not the number of objects, so make([]string, len(objects)) would
+	// prepend blank entries.
+	keys := make([]string, 0)
 
 	for object := range objects {
+		if object.Err != nil {
+			s3.logger.Error("list failed",
+				zap.String("prefix", prefix),
+				zap.String("s3_error_code", s3ErrorCode(object.Err)),
+				zap.Error(object.Err))
+			return keys, object.Err
+		}
 		keys = append(keys, s3.CutKeyPrefix(object.Key))
 	}
 
@@ -268,12 +330,15 @@ func (s3 *S3) Stat(ctx context.Context, key string) (certmagic.KeyInfo, error) {
 	object, err := s3.client.StatObject(ctx, s3.Bucket, key, minio.StatObjectOptions{})
 
 	if err != nil {
-		s3.logger.Error(fmt.Sprintf("Stat key: %s, error: %v", key, err))
+		s3.logger.Error("stat failed",
+			zap.String("key", key),
+			zap.String("s3_error_code", s3ErrorCode(err)),
+			zap.Error(err))
 
 		return certmagic.KeyInfo{}, nil
 	}
 
-	s3.logger.Debug(fmt.Sprintf("Stat key: %s, size: %d bytes", key, object.Size))
+	s3.logger.Debug("stat", zap.String("key", key), zap.Int64("bytes", object.Size))
 
 	return certmagic.KeyInfo{
 		Key:        object.Key,
@@ -281,6 +346,28 @@ func (s3 *S3) Stat(ctx context.Context, key string) (certmagic.KeyInfo, error) {
 		Size:       object.Size,
 		IsTerminal: strings.HasSuffix(object.Key, "/"),
 	}, err
+}
+
+// s3ErrorCode extracts the S3/minio error code (e.g. "NoSuchKey", "SlowDown",
+// "RequestLimitExceeded") when available. Throttling surfaces here as
+// "SlowDown" or "RequestLimitExceeded" — the signal to look for when S3 is the
+// bottleneck. Returns "" for non-S3 errors (e.g. transport failures).
+func s3ErrorCode(err error) string {
+	return minio.ToErrorResponse(err).Code
+}
+
+// isNotExist reports whether err is a genuine "object not found" response, as
+// opposed to a transport, throttling or permission error that merely looks
+// like absence to a naive err != nil check.
+func isNotExist(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return true
+	}
+	resp := minio.ToErrorResponse(err)
+	return resp.StatusCode == http.StatusNotFound || resp.Code == "NoSuchKey"
 }
 
 func (s3 *S3) KeyPrefix(key string) string {
