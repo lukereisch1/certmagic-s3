@@ -13,6 +13,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -36,8 +37,10 @@ func init() {
 }
 
 type S3 struct {
-	logger *zap.Logger
-	client *minio.Client
+	logger  *zap.Logger
+	client  *minio.Client
+	locksMu sync.Mutex
+	locks   map[string]*s3Lock
 
 	// S3 configuration
 	Host           string `json:"host"`
@@ -187,20 +190,6 @@ func (*S3) CaddyModule() caddy.ModuleInfo {
 
 func (s3 *S3) CertMagicStorage() (certmagic.Storage, error) {
 	return s3, nil
-}
-
-// Lock and Unlock are intentional no-ops in this fork: this plugin does not
-// implement certmagic's distributed lock in S3. That means certificate
-// issuance is NOT serialized or deduplicated across goroutines or across
-// instances, so concurrent requests for the same domain can each fire their
-// own ACME order. If you are overwhelming the CA on cold start, this is the
-// most likely root cause and wants a real S3-backed lock, not just logging.
-func (s3 *S3) Lock(ctx context.Context, key string) error {
-	return nil
-}
-
-func (s3 *S3) Unlock(ctx context.Context, key string) error {
-	return nil
 }
 
 func (s3 *S3) Store(ctx context.Context, key string, value []byte) error {
